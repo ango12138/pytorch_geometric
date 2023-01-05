@@ -52,6 +52,7 @@ test_requires = [
     'pytest-cov',
     'onnx',
     'onnxruntime',
+    'torchtyping',
 ]
 
 dev_requires = test_requires + [
