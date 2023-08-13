@@ -620,10 +620,10 @@ def from_dgl(
 
 
 def from_hetero_networkx(
-    G: Any, node_type_attribute: str,
-    edge_type_attribute: Optional[str] = None,
-    graph_attrs: Optional[Iterable[str]] = None
-) -> 'torch_geometric.data.HeteroData':
+        G: Any, node_type_attribute: str,
+        edge_type_attribute: Optional[str] = None,
+        graph_attrs: Optional[Iterable[str]] = None,
+        nodes: Optional[List] = None) -> 'torch_geometric.data.HeteroData':
     r"""Converts a :obj:`networkx.Graph` or :obj:`networkx.DiGraph` to a
     :class:`torch_geometric.data.HeteroData` instance.
 
@@ -640,6 +640,9 @@ def from_hetero_networkx(
             must be set for every edge in the graph. (default: :obj:`None`)
         graph_attrs (iterable of str, optional): The graph attributes to be
             copied. (default: :obj:`None`)
+        nodes (list, optional): The list of nodes whose attributes are to
+            be collected. If set to :obj:`None`, all nodes of the graph
+            will be included. (default: :obj:`None`)
 
     Example:
 
@@ -720,6 +723,9 @@ def from_hetero_networkx(
         return data
 
     G = G.to_directed() if not nx.is_directed(G) else G
+
+    if nodes is not None:
+        G = nx.subgraph(G, nodes)
 
     hetero_data_dict = {}
 
