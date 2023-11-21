@@ -105,6 +105,7 @@ class InMemoryDataset(Dataset, ABC):
             self._data_list = self.len() * [None]
         elif self._data_list[idx] is not None:
             return copy.copy(self._data_list[idx])
+        self._data._num_graphs = self.len()
 
         data = separate(
             cls=self._data.__class__,
@@ -148,6 +149,7 @@ class InMemoryDataset(Dataset, ABC):
             increment=False,
             add_batch=False,
         )
+        data._num_graphs = len(data_list)
 
         return data, slices
 
