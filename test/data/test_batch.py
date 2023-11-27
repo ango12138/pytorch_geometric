@@ -69,12 +69,12 @@ def test_batch_basic():
     assert str(batch[2]) == ("Data(x=[4], edge_index=[2, 6], y=[1], "
                              "string='3', array=[4], num_nodes=4)")
 
-    assert len(batch.index_select([1, 0])) == 2
-    assert len(batch.index_select(torch.tensor([1, 0]))) == 2
-    assert len(batch.index_select(torch.tensor([True, False]))) == 1
-    assert len(batch.index_select(np.array([1, 0], dtype=np.int64))) == 2
-    assert len(batch.index_select(np.array([True, False]))) == 1
-    assert len(batch[:2]) == 2
+    assert batch.index_select([1, 0]).num_graphs == 2
+    assert batch.index_select(torch.tensor([1, 0])).num_graphs == 2
+    assert batch.index_select(torch.tensor([True, False])).num_graphs == 1
+    assert batch.index_select(np.array([1, 0], dtype=np.int64)).num_graphs == 2
+    assert batch.index_select(np.array([True, False])).num_graphs == 1
+    assert batch[:2].num_graphs == 2
 
     data_list = batch.to_data_list()
     assert len(data_list) == 3
