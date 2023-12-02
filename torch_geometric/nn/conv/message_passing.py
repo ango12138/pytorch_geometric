@@ -568,18 +568,25 @@ class MessagePassing(torch.nn.Module):
         # conv.explain_message = explain_message.__get__(conv, MessagePassing)
         # see stackoverflow.com: 394770/override-a-method-at-instance-level
         edge_mask = self._edge_mask
+        loop_mask = self._loop_mask
 
         if edge_mask is None:
             raise ValueError(f"Could not find a pre-defined 'edge_mask' as "
                              f"part of {self.__class__.__name__}.")
 
+        return self._explain_message_with_masks(inputs, size_i, edge_mask,
+                                                loop_mask)
+
+    def _explain_message_with_masks(self, inputs: Tensor, size_i: int,
+                                    edge_mask: Tensor,
+                                    loop_mask: Tensor) -> Tensor:
         if self._apply_sigmoid:
             edge_mask = edge_mask.sigmoid()
 
         # Some ops add self-loops to `edge_index`. We need to do the same for
         # `edge_mask` (but do not train these entries).
         if inputs.size(self.node_dim) != edge_mask.size(0):
-            edge_mask = edge_mask[self._loop_mask]
+            edge_mask = edge_mask[loop_mask]
             loop = edge_mask.new_ones(size_i)
             edge_mask = torch.cat([edge_mask, loop], dim=0)
         assert inputs.size(self.node_dim) == edge_mask.size(0)
