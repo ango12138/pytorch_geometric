@@ -1,4 +1,5 @@
 import functools
+import typing
 from enum import Enum
 from typing import (
     Any,
@@ -10,6 +11,8 @@ from typing import (
     Set,
     Tuple,
     Union,
+    get_args,
+    overload,
 )
 
 import torch
@@ -17,7 +20,6 @@ from torch import Tensor
 
 import torch_geometric.typing
 from torch_geometric.typing import SparseTensor
-from torch_geometric.utils import index_sort
 
 HANDLED_FUNCTIONS: Dict[Callable, Callable] = {}
 
@@ -26,12 +28,22 @@ if torch_geometric.typing.WITH_PT20:
         torch.int32,
         torch.int64,
     }
-else:
+elif not typing.TYPE_CHECKING:  # pragma: no cover
     SUPPORTED_DTYPES: Set[torch.dtype] = {
         torch.int64,
     }
 
-ReduceType = Literal['sum']
+ReduceType = Literal['sum', 'mean', 'amin', 'amax', 'add', 'min', 'max']
+PYG_REDUCE: Dict[ReduceType, ReduceType] = {
+    'add': 'sum',
+    'amin': 'min',
+    'amax': 'max'
+}
+TORCH_REDUCE: Dict[ReduceType, ReduceType] = {
+    'add': 'sum',
+    'min': 'amin',
+    'max': 'amax'
+}
 
 
 class SortOrder(Enum):
@@ -81,8 +93,8 @@ def assert_contiguous(tensor: Tensor):
 
 def assert_symmetric(size: Tuple[Optional[int], Optional[int]]):
     if size[0] is not None and size[1] is not None and size[0] != size[1]:
-        raise ValueError("'EdgeIndex' is undirected but received a "
-                         "non-symmetric size")
+        raise ValueError(f"'EdgeIndex' is undirected but received a "
+                         f"non-symmetric size (got {list(size)})")
 
 
 def assert_sorted(func):
@@ -99,10 +111,10 @@ def assert_sorted(func):
 
 
 class EdgeIndex(Tensor):
-    r"""An COO :obj:`edge_index` tensor with additional (meta)data attached.
+    r"""A COO :obj:`edge_index` tensor with additional (meta)data attached.
 
-    :class:`EdgeIndex` is a :pytorch:`null` class:`torch.Tensor`, that holds an
-    :obj:`edge_index` representation of shape :obj:`[2, num_edges]`.
+    :class:`EdgeIndex` is a :pytorch:`null` :class:`torch.Tensor`, that holds
+    an :obj:`edge_index` representation of shape :obj:`[2, num_edges]`.
     Edges are given as pairwise source and destination node indices in sparse
     COO format.
 
@@ -128,7 +140,7 @@ class EdgeIndex(Tensor):
 
     .. code-block:: python
 
-        from torch_geometric.data import EdgeIndex
+        from torch_geometric import EdgeIndex
 
         edge_index = EdgeIndex(
             [[0, 1, 1, 2],
@@ -141,14 +153,14 @@ class EdgeIndex(Tensor):
         >>> EdgeIndex([[0, 1, 1, 2],
         ...            [1, 0, 2, 1]])
         assert edge_index.is_sorted_by_row
-        assert not edge_index.is_undirected
+        assert edge_index.is_undirected
 
         # Flipping order:
         edge_index = edge_index.flip(0)
         >>> EdgeIndex([[1, 0, 2, 1],
         ...            [0, 1, 1, 2]])
         assert edge_index.is_sorted_by_col
-        assert not edge_index.is_undirected
+        assert edge_index.is_undirected
 
         # Filtering:
         mask = torch.tensor([True, True, True, False])
@@ -159,7 +171,7 @@ class EdgeIndex(Tensor):
         assert not edge_index.is_undirected
 
         # Sparse-Dense Matrix Multiplication:
-        out = edge_index @ torch.randn(3, 16)
+        out = edge_index.flip(0) @ torch.randn(3, 16)
         assert out.size() == (3, 16)
     """
     # See "https://pytorch.org/docs/stable/notes/extending.html"
@@ -221,7 +233,10 @@ class EdgeIndex(Tensor):
             elif sparse_size[0] is None and sparse_size[1] is not None:
                 sparse_size = (sparse_size[1], sparse_size[1])
 
-        out = super().__new__(cls, data)
+        if torch_geometric.typing.WITH_PT112:
+            out = super().__new__(cls, data)
+        else:
+            out = Tensor._make_subclass(cls, data)
 
         # Attach metadata:
         out._sparse_size = sparse_size
@@ -284,6 +299,14 @@ class EdgeIndex(Tensor):
 
     # Properties ##############################################################
 
+    @overload
+    def sparse_size(self) -> Tuple[Optional[int], Optional[int]]:
+        pass
+
+    @overload
+    def sparse_size(self, dim: int) -> Optional[int]:
+        pass
+
     def sparse_size(
         self,
         dim: Optional[int] = None,
@@ -291,6 +314,10 @@ class EdgeIndex(Tensor):
         r"""The size of the underlying sparse matrix.
         If :obj:`dim` is specified, returns an integer holding the size of that
         sparse dimension.
+
+        Args:
+            dim (int, optional): The dimension for which to retrieve the size.
+                (default: :obj:`None`)
         """
         if dim is not None:
             return self._sparse_size[dim]
@@ -335,6 +362,14 @@ class EdgeIndex(Tensor):
 
     # Cache Interface #########################################################
 
+    @overload
+    def get_sparse_size(self) -> torch.Size:
+        pass
+
+    @overload
+    def get_sparse_size(self, dim: int) -> int:
+        pass
+
     def get_sparse_size(
         self,
         dim: Optional[int] = None,
@@ -343,6 +378,10 @@ class EdgeIndex(Tensor):
         Automatically computed and cached when not explicitly set.
         If :obj:`dim` is specified, returns an integer holding the size of that
         sparse dimension.
+
+        Args:
+            dim (int, optional): The dimension for which to retrieve the size.
+                (default: :obj:`None`)
         """
         if dim is not None:
             if self._sparse_size[dim] is not None:
@@ -393,6 +432,8 @@ class EdgeIndex(Tensor):
 
     @assert_sorted
     def _sort_by_transpose(self) -> Tuple[Tuple[Tensor, Tensor], Tensor]:
+        from torch_geometric.utils import index_sort
+
         dim = 1 if self.is_sorted_by_row else 0
 
         if self._T_perm is None:
@@ -461,11 +502,10 @@ class EdgeIndex(Tensor):
             if (dtype or torch.get_default_dtype()) == self._value.dtype:
                 return self._value
 
-        if (torch_geometric.typing.WITH_PT20
-                and not torch_geometric.typing.WITH_ARM):
+        if torch_geometric.typing.WITH_PT20 and not self.is_cuda:
             value = torch.ones(1, dtype=dtype, device=self.device)
             value = value.expand(self.size(1))
-        else:
+        else:  # pragma: no cover
             value = torch.ones(self.size(1), dtype=dtype, device=self.device)
 
         self._value = value
@@ -515,6 +555,8 @@ class EdgeIndex(Tensor):
                 guarantees that the order of equivalent elements is preserved.
                 (default: :obj:`False`)
         """
+        from torch_geometric.utils import index_sort
+
         sort_order = SortOrder(sort_order)
 
         if self._sort_order == sort_order:  # Nothing to do.
@@ -559,9 +601,9 @@ class EdgeIndex(Tensor):
         r"""Converts :class:`EdgeIndex` into a dense :class:`torch.Tensor`.
 
         Args:
-            value (torch.Tensor, optional): The values for sparse indices. If
-                not specified, sparse indices will be assigned a value of
-                :obj:`1`. (default: :obj:`None`)
+            value (torch.Tensor, optional): The values for non-zero elements.
+                If not specified, non-zero elements will be assigned a value of
+                :obj:`1.0`. (default: :obj:`None`)
             fill_value (float, optional): The fill value for remaining elements
                 in the dense matrix. (default: :obj:`0.0`)
             dtype (torch.dtype, optional): The data type of the returned
@@ -585,9 +627,9 @@ class EdgeIndex(Tensor):
         :class:`torch.sparse_coo_tensor`.
 
         Args:
-            value (torch.Tensor, optional): The values for sparse indices. If
-                not specified, sparse indices will be assigned a value of
-                :obj:`1`. (default: :obj:`None`)
+            value (torch.Tensor, optional): The values for non-zero elements.
+                If not specified, non-zero elements will be assigned a value of
+                :obj:`1.0`. (default: :obj:`None`)
         """
         value = self._get_value() if value is None else value
         out = torch.sparse_coo_tensor(
@@ -608,9 +650,9 @@ class EdgeIndex(Tensor):
         :class:`torch.sparse_csr_tensor`.
 
         Args:
-            value (torch.Tensor, optional): The values for sparse indices. If
-                not specified, sparse indices will be assigned a value of
-                :obj:`1`. (default: :obj:`None`)
+            value (torch.Tensor, optional): The values for non-zero elements.
+                If not specified, non-zero elements will be assigned a value of
+                :obj:`1.0`. (default: :obj:`None`)
         """
         (rowptr, col), perm = self.get_csr()
         value = self._get_value() if value is None else value[perm]
@@ -629,9 +671,9 @@ class EdgeIndex(Tensor):
         :class:`torch.sparse_csc_tensor`.
 
         Args:
-            value (torch.Tensor, optional): The values for sparse indices. If
-                not specified, sparse indices will be assigned a value of
-                :obj:`1`. (default: :obj:`None`)
+            value (torch.Tensor, optional): The values for non-zero elements.
+                If not specified, non-zero elements will be assigned a value of
+                :obj:`1.0`. (default: :obj:`None`)
         """
         if not torch_geometric.typing.WITH_PT112:
             raise NotImplementedError(
@@ -662,9 +704,9 @@ class EdgeIndex(Tensor):
             layout (torch.layout, optional): The desired sparse layout. One of
                 :obj:`torch.sparse_coo`, :obj:`torch.sparse_csr`, or
                 :obj:`torch.sparse_csc`. (default: :obj:`torch.sparse_coo`)
-            value (torch.Tensor, optional): The values for sparse indices. If
-                not specified, sparse indices will be assigned a value of
-                :obj:`1`. (default: :obj:`None`)
+            value (torch.Tensor, optional): The values for non-zero elements.
+                If not specified, non-zero elements will be assigned a value of
+                :obj:`1.0`. (default: :obj:`None`)
         """
         if layout is None or layout == torch.sparse_coo:
             return self.to_sparse_coo(value)
@@ -684,7 +726,7 @@ class EdgeIndex(Tensor):
         Requires that :obj:`torch-sparse` is installed.
 
         Args:
-            value (torch.Tensor, optional): The values for sparse indices.
+            value (torch.Tensor, optional): The values for non-zero elements.
                 (default: :obj:`None`)
         """
         return SparseTensor(
@@ -697,14 +739,85 @@ class EdgeIndex(Tensor):
             trust_data=True,
         )
 
+    @overload
+    def matmul(
+        self,
+        other: 'EdgeIndex',
+        input_value: Optional[Tensor],
+        other_value: Optional[Tensor],
+        reduce: ReduceType,
+        transpose: bool,
+    ) -> Tuple['EdgeIndex', Tensor]:
+        pass
+
+    @overload
+    def matmul(
+        self,
+        other: Tensor,
+        input_value: Optional[Tensor],
+        other_value: Optional[Tensor],
+        reduce: ReduceType,
+        transpose: bool,
+    ) -> Tensor:
+        pass
+
     def matmul(
         self,
         other: Union[Tensor, 'EdgeIndex'],
         input_value: Optional[Tensor] = None,
         other_value: Optional[Tensor] = None,
         reduce: ReduceType = 'sum',
+        transpose: bool = False,
     ) -> Union[Tensor, Tuple['EdgeIndex', Tensor]]:
-        return matmul(self, other, input_value, other_value, reduce)
+        r"""Performs a matrix multiplication of the matrices :obj:`input` and
+        :obj:`other`.
+        If :obj:`input` is a :math:`(n \times m)` matrix and :obj:`other` is a
+        :math:`(m \times p)` tensor, then the output will be a
+        :math:`(n \times p)` tensor.
+        See :meth:`torch.matmul` for more information.
+
+        :obj:`input` is a sparse matrix as denoted by the indices in
+        :class:`EdgeIndex`, and :obj:`input_value` corresponds to the values
+        of non-zero elements in :obj:`input`.
+        If not specified, non-zero elements will be assigned a value of
+        :obj:`1.0`.
+
+        :obj:`other` can either be a dense :class:`torch.Tensor` or a sparse
+        :class:`EdgeIndex`.
+        if :obj:`other` is a sparse :class:`EdgeIndex`, then :obj:`other_value`
+        corresponds to the values of its non-zero elements.
+
+        This function additionally accepts an optional :obj:`reduce` argument
+        that allows specification of an optional reduction operation.
+        See :meth:`torch.sparse.mm` for more information.
+
+        Lastly, the :obj:`transpose` option allows to perform matrix
+        multiplication where :obj:`input` will be first transposed, *i.e.*:
+
+        .. math::
+
+            \textrm{input}^{\top} \cdot \textrm{other}
+
+        Args:
+            other (torch.Tensor or EdgeIndex): The second matrix to be
+                multiplied, which can be sparse or dense.
+            input_value (torch.Tensor, optional): The values for non-zero
+                elements of :obj:`input`.
+                If not specified, non-zero elements will be assigned a value of
+                :obj:`1.0`. (default: :obj:`None`)
+            other_value (torch.Tensor, optional): The values for non-zero
+                elements of :obj:`other` in case it is sparse.
+                If not specified, non-zero elements will be assigned a value of
+                :obj:`1.0`. (default: :obj:`None`)
+            reduce (str, optional): The reduce operation, one of
+                :obj:`"sum"`/:obj:`"add"`, :obj:`"mean"`,
+                :obj:`"min"`/:obj:`amin` or :obj:`"max"`/:obj:`amax`.
+                (default: :obj:`"sum"`)
+            transpose (bool, optional): If set to :obj:`True`, will perform
+                matrix multiplication based on the transposed :obj:`input`.
+                (default: :obj:`False`)
+        """
+        return matmul(self, other, input_value, other_value, reduce, transpose)
 
     @classmethod
     def __torch_function__(cls, func, types, args=(), kwargs=None):
@@ -794,7 +907,7 @@ def cpu(tensor: EdgeIndex, *args, **kwargs) -> EdgeIndex:
 
 
 @implements(Tensor.cuda)
-def cuda(tensor: EdgeIndex, *args, **kwargs) -> EdgeIndex:
+def cuda(tensor: EdgeIndex, *args, **kwargs) -> EdgeIndex:  # pragma: no cover
     return apply_(tensor, Tensor.cuda, *args, **kwargs)
 
 
@@ -825,18 +938,20 @@ def cat(
     out = out.as_subclass(EdgeIndex)
 
     # Post-process `sparse_size`:
-    num_rows = 0
+    num_rows: Optional[int] = 0
     for tensor in tensors:
         if not isinstance(tensor, EdgeIndex) or tensor.num_rows is None:
             num_rows = None
             break
+        assert isinstance(num_rows, int)
         num_rows = max(num_rows, tensor.num_rows)
 
-    num_cols = 0
+    num_cols: Optional[int] = 0
     for tensor in tensors:
         if not isinstance(tensor, EdgeIndex) or tensor.num_cols is None:
             num_cols = None
             break
+        assert isinstance(num_cols, int)
         num_cols = max(num_cols, tensor.num_cols)
 
     out._sparse_size = (num_rows, num_cols)
@@ -977,131 +1092,200 @@ def _torch_sparse_spmm(
     other: Tensor,
     value: Optional[Tensor] = None,
     reduce: ReduceType = 'sum',
+    transpose: bool = False,
 ) -> Tensor:
     # `torch-sparse` still provides a faster sparse-dense matrix multiplication
     # code path on GPUs (after all these years...):
-    assert input.is_sorted_by_row
     assert torch_geometric.typing.WITH_TORCH_SPARSE
-
-    rowptr = input.get_rowptr()
-    col = input[1]
+    reduce = PYG_REDUCE[reduce] if reduce in PYG_REDUCE else reduce
 
     # Optional arguments for backpropagation:
-    row: Optional[Tensor] = None
-    rowcount: Optional[Tensor] = None
     colptr: Optional[Tensor] = None
-    csr2csc: Optional[Tensor] = None
+    perm: Optional[Tensor] = None
+
+    if not transpose:
+        assert input.is_sorted_by_row
+        (rowptr, col), _ = input.get_csr()
+        row = input[0]
+        if other.requires_grad and reduce in ['sum', 'mean']:
+            (colptr, _), perm = input.get_csc()
+    else:
+        assert input.is_sorted_by_col
+        (rowptr, col), _ = input.get_csc()
+        row = input[1]
+        if other.requires_grad and reduce in ['sum', 'mean']:
+            (colptr, _), perm = input.get_csr()
 
     if reduce == 'sum':
-        if value is not None and value.requires_grad:
-            row = input[0]
-        if other.requires_grad:
-            row = input[0]
-            csr2csc = input._get_csr2csc()
-            colptr = input.get_colptr()
         return torch.ops.torch_sparse.spmm_sum(  #
-            row, rowptr, col, value, colptr, csr2csc, other)
+            row, rowptr, col, value, colptr, perm, other)
 
     if reduce == 'mean':
-        if value is not None and value.requires_grad:
-            row = input[0]
-        if other.requires_grad:
-            row = input[0]
-            rowcount = rowptr.diff()
-            csr2csc = input._get_csr2csc()
-            colptr = input.get_colptr()
+        rowcount = rowptr.diff() if other.requires_grad else None
         return torch.ops.torch_sparse.spmm_mean(  #
-            row, rowptr, col, value, rowcount, colptr, csr2csc, other)
+            row, rowptr, col, value, rowcount, colptr, perm, other)
 
-    if reduce == 'amin':
-        return torch.ops.torch_sparse.spmm_min(rowptr, col, value, other)
+    if reduce == 'min':
+        return torch.ops.torch_sparse.spmm_min(rowptr, col, value, other)[0]
 
-    if reduce == 'amax':
-        return torch.ops.torch_sparse.spmm_max(rowptr, col, value, other)
+    if reduce == 'max':
+        return torch.ops.torch_sparse.spmm_max(rowptr, col, value, other)[0]
 
     raise NotImplementedError
 
 
-class SparseDenseMatmul(torch.autograd.Function):
+class _TorchSPMM(torch.autograd.Function):
     @staticmethod
     def forward(
         ctx,
         input: EdgeIndex,
         other: Tensor,
-        input_value: Optional[Tensor] = None,
+        value: Optional[Tensor] = None,
         reduce: ReduceType = 'sum',
+        transpose: bool = False,
     ) -> Tensor:
 
-        if reduce not in ReduceType.__args__:
-            raise NotImplementedError(f"`reduce='{reduce}'` not yet supported")
+        reduce = TORCH_REDUCE[reduce] if reduce in TORCH_REDUCE else reduce
 
+        value = value.detach() if value is not None else value
         if other.requires_grad:
-            ctx.save_for_backward(input, input_value)
+            other = other.detach()
+            ctx.save_for_backward(input, value)
+            ctx.reduce = reduce
+            ctx.transpose = transpose
 
-        other = other.detach()
-        if input_value is not None:
-            input_value = input_value.detach()
+        if not transpose:
+            assert input.is_sorted_by_row
+            adj = input.to_sparse_csr(value)
+        else:
+            assert input.is_sorted_by_col
+            adj = input.to_sparse_csc(value).t()
 
-        if other.is_cuda and torch_geometric.typing.WITH_TORCH_SPARSE:
-            # If `torch-sparse` is available, it still provides a faster
-            # sparse-dense matmul code path (after all these years...):
-            (rowptr, col), perm = input.get_csr()
-            if input_value is not None:
-                input_value = input_value[perm]
-            return torch.ops.torch_sparse.spmm_sum(  #
-                None, rowptr, col, input_value, None, None, other)
-
-        if input_value is None:
-            input_value = input._get_value()
-        adj = input.to_sparse_csr(input_value)
-
-        return adj @ other
+        if torch_geometric.typing.WITH_PT20 and not other.is_cuda:
+            return torch.sparse.mm(adj, other, reduce)
+        else:  # pragma: no cover
+            assert reduce == 'sum'
+            return adj @ other
 
     @staticmethod
     def backward(
         ctx,
         out_grad: Tensor,
-    ) -> Tuple[None, Optional[Tensor], None, None]:
-
-        # TODO Leverage `is_undirected` in case `input_value` is None.
+    ) -> Tuple[None, Optional[Tensor], None, None, None]:
 
         other_grad: Optional[Tensor] = None
         if ctx.needs_input_grad[1]:
-            input, input_value = ctx.saved_tensors
+            input, value = ctx.saved_tensors
+            assert ctx.reduce == 'sum'
 
-            # We need to compute `adj.t() @ out_grad`. For the transpose, we
-            # first sort by column and then create a CSR matrix from it.
-            # We can call `input.flip(0)` here and create a sparse CSR matrix
-            # from it, but creating it via `colptr` directly is more efficient:
-            # Note that the sort result is cached across multiple applications.
-            (colptr, row), perm = input.get_csc()
-
-            if input_value is not None:
-                input_value = input_value.detach()[perm]
-
-            if out_grad.is_cuda and torch_geometric.typing.WITH_TORCH_SPARSE:
-                other_grad = torch.ops.torch_sparse.spmm_sum(  #
-                    None, colptr, row, input_value, None, None, out_grad)
-
+            if not ctx.transpose:
+                if value is None and input.is_undirected:
+                    adj = input.to_sparse_csr(value)
+                else:
+                    (colptr, row), perm = input.get_csc()
+                    if value is not None:
+                        value = value[perm]
+                    else:
+                        value = input._get_value()
+                    adj = torch.sparse_csr_tensor(
+                        crow_indices=colptr,
+                        col_indices=row,
+                        values=value,
+                        size=input.get_sparse_size()[::-1],
+                        device=input.device,
+                    )
             else:
-                if input_value is None:
-                    input_value = input._get_value()
+                if value is None and input.is_undirected:
+                    adj = input.to_sparse_csc(value).t()
+                else:
+                    (rowptr, col), perm = input.get_csr()
+                    if value is not None:
+                        value = value[perm]
+                    else:
+                        value = input._get_value()
+                    adj = torch.sparse_csr_tensor(
+                        crow_indices=rowptr,
+                        col_indices=col,
+                        values=value,
+                        size=input.get_sparse_size()[::-1],
+                        device=input.device,
+                    )
 
-                adj_t = torch.sparse_csr_tensor(
-                    crow_indices=colptr,
-                    col_indices=row,
-                    values=input_value,
-                    size=input.get_sparse_size()[::-1],
-                    device=input.device,
-                )
-
-                other_grad = adj_t @ out_grad
+            other_grad = adj @ out_grad
 
         if ctx.needs_input_grad[2]:
-            raise NotImplementedError("Gradient computation for 'input_value' "
-                                      "not yet supported")
+            raise NotImplementedError("Gradient computation for 'value' not "
+                                      "yet supported")
 
-        return None, other_grad, None, None
+        return None, other_grad, None, None, None
+
+
+def _scatter_spmm(
+    input: EdgeIndex,
+    other: Tensor,
+    value: Optional[Tensor] = None,
+    reduce: ReduceType = 'sum',
+    transpose: bool = False,
+) -> Tensor:
+    from torch_geometric.utils import scatter
+
+    if not transpose:
+        other_j = other[input[1]]
+        index = input[0]
+    else:
+        other_j = other[input[0]]
+        index = input[1]
+
+    other_j = other_j * value.view(-1, 1) if value is not None else other_j
+    return scatter(other_j, index, 0, dim_size=other.size(0), reduce=reduce)
+
+
+def _spmm(
+    input: EdgeIndex,
+    other: Tensor,
+    value: Optional[Tensor] = None,
+    reduce: ReduceType = 'sum',
+    transpose: bool = False,
+) -> Tensor:
+
+    if reduce not in get_args(ReduceType):
+        raise ValueError(f"`reduce='{reduce}'` is not a valid reduction")
+
+    if not transpose and not input.is_sorted_by_row:
+        cls_name = input.__class__.__name__
+        raise ValueError(f"'matmul(..., transpose=False)' requires "
+                         f"'{cls_name}' to be sorted by rows")
+
+    if transpose and not input.is_sorted_by_col:
+        cls_name = input.__class__.__name__
+        raise ValueError(f"'matmul(..., transpose=True)' requires "
+                         f"'{cls_name}' to be sorted by colums")
+
+    if (torch_geometric.typing.WITH_TORCH_SPARSE
+            and other.is_cuda):  # pragma: no cover
+        return _torch_sparse_spmm(input, other, value, reduce, transpose)
+
+    if value is not None and value.requires_grad:
+        if torch_geometric.typing.WITH_TORCH_SPARSE:
+            return _torch_sparse_spmm(input, other, value, reduce, transpose)
+        return _scatter_spmm(input, other, value, reduce, transpose)
+
+    if reduce == 'sum' or reduce == 'add':
+        return _TorchSPMM.apply(input, other, value, 'sum', transpose)
+
+    if reduce == 'mean':
+        out = _TorchSPMM.apply(input, other, value, 'sum', transpose)
+        count = input.get_indptr().diff()
+        return out / count.clamp_(min=1).to(out.dtype).view(-1, 1)
+
+    if (torch_geometric.typing.WITH_PT20 and not other.is_cuda
+            and not other.requires_grad):
+        return _TorchSPMM.apply(input, other, value, reduce, transpose)
+
+    if torch_geometric.typing.WITH_TORCH_SPARSE:
+        return _torch_sparse_spmm(input, other, value, reduce, transpose)
+
+    return _scatter_spmm(input, other, value, reduce, transpose)
 
 
 def matmul(
@@ -1110,42 +1294,61 @@ def matmul(
     input_value: Optional[Tensor] = None,
     other_value: Optional[Tensor] = None,
     reduce: ReduceType = 'sum',
+    transpose: bool = False,
 ) -> Union[Tensor, Tuple[EdgeIndex, Tensor]]:
-
-    if reduce not in ReduceType.__args__:
-        raise NotImplementedError(f"`reduce='{reduce}'` not yet supported")
 
     if not isinstance(other, EdgeIndex):
         if other_value is not None:
             raise ValueError("'other_value' not supported for sparse-dense "
                              "matrix multiplication")
-        return SparseDenseMatmul.apply(input, other, input_value, reduce)
+        return _spmm(input, other, input_value, reduce, transpose)
 
-    if input.is_sorted_by_col:
+    if reduce not in ['sum', 'add']:
+        raise NotImplementedError(f"`reduce='{reduce}'` not yet supported for "
+                                  f"sparse-sparse matrix multiplication")
+
+    transpose &= not input.is_undirected or input_value is not None
+
+    if torch_geometric.typing.WITH_WINDOWS:  # pragma: no cover
+        input = input.to_sparse_coo(input_value)
+    elif input.is_sorted_by_col:
         input = input.to_sparse_csc(input_value)
     else:
         input = input.to_sparse_csr(input_value)
 
-    if other.is_sorted_by_col:
+    if transpose:
+        input = input.t()
+
+    if torch_geometric.typing.WITH_WINDOWS:  # pragma: no cover
+        other = other.to_sparse_coo(input_value)
+    elif other.is_sorted_by_col:
         other = other.to_sparse_csc(other_value)
     else:
         other = other.to_sparse_csr(other_value)
 
     out = torch.matmul(input, other)
-    assert out.layout == torch.sparse_csr
 
-    rowptr, col = out.crow_indices(), out.col_indices()
-    edge_index = torch._convert_indices_from_csr_to_coo(
-        rowptr, col, out_int32=rowptr.dtype != torch.int64)
+    rowptr: Optional[Tensor] = None
+    if out.layout == torch.sparse_csr:
+        rowptr, col = out.crow_indices(), out.col_indices()
+        edge_index = torch._convert_indices_from_csr_to_coo(
+            rowptr, col, out_int32=rowptr.dtype != torch.int64)
+
+    elif out.layout == torch.sparse_coo:  # pragma: no cover
+        edge_index = out.indices()
+
+    else:
+        raise NotImplementedError
 
     edge_index = edge_index.as_subclass(EdgeIndex)
     edge_index._sort_order = SortOrder.ROW
     edge_index._sparse_size = (out.size(0), out.size(1))
-    edge_index._rowptr = rowptr
+    edge_index._indptr = rowptr
 
     return edge_index, out.values()
 
 
+@implements(torch.mm)
 @implements(torch.matmul)
 @implements(Tensor.matmul)
 def _matmul1(
