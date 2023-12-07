@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- Added ability to use `CaptumExplainer` to explain heterogeneous GNNs with `HANConv` and `HGTConv` layers ([#8512](https://github.com/pyg-team/pytorch_geometric/pull/8512))
 - Added warning when calling `dataset.num_classes` on regression problems ([#8550](https://github.com/pyg-team/pytorch_geometric/pull/8550))
 - Added the `NDCG@k` metric for link-prediction ([#8326](https://github.com/pyg-team/pytorch_geometric/pull/8326))
 - Added relabel node functionality to `dropout_node` ([#8524](https://github.com/pyg-team/pytorch_geometric/pull/8524))
